@@ -3,11 +3,61 @@ import asyncio
 import bisect
 import os
 import shlex
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 
 from pathlib import Path
+
+
+HERE = Path(__file__).resolve().parent
+
+# libxcb-cursor0 and friends unpacked here without root, see the README
+VENDOR_LIB = HERE / "vendor" / "usr" / "lib" / "x86_64-linux-gnu"
+
+
+def prefer_x11():
+    """Restart under the X11 backend before Qt is ever imported.
+
+    Only X11 lets the overlay sit above every window on every workspace:
+    a native Wayland client cannot ask for either. Under a Wayland session
+    this means going through XWayland, which is what QT_QPA_PLATFORM=xcb
+    selects. LD_LIBRARY_PATH has to be set before the process starts, so
+    the only way to apply it is to exec ourselves again.
+    """
+
+    if os.environ.get("SPOTIFY_OVERLAY_RELAUNCHED"):
+        return
+
+    if os.environ.get("QT_QPA_PLATFORM"):
+        return
+
+    if not os.environ.get("DISPLAY"):
+        return
+
+    environment = dict(os.environ)
+
+    environment["SPOTIFY_OVERLAY_RELAUNCHED"] = "1"
+    environment["QT_QPA_PLATFORM"] = "xcb"
+
+    if VENDOR_LIB.is_dir():
+
+        environment["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [str(VENDOR_LIB)]
+            + (
+                [environment["LD_LIBRARY_PATH"]]
+                if environment.get("LD_LIBRARY_PATH")
+                else []
+            )
+        )
+
+    os.execve(sys.executable, sys.orig_argv, environment)
+
+
+prefer_x11()
+
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -38,6 +88,9 @@ class SpotifyWorker(QObject):
         self.last_index = None
         self.last_paused = None
         self.last_position = 0.0
+
+        self.song_label = ""
+        self.synced = True
 
         self.current_lyrics = []
         self.times = []
@@ -91,6 +144,18 @@ class SpotifyWorker(QObject):
 
                     # frozen: whatever line is on screen stays on screen
                     self.set_paused(True)
+
+                    if self.last_song is None:
+
+                        # ...except on the very first look, when there is
+                        # nothing on screen yet to freeze
+                        meta = await spotify.metadata()
+
+                        self.load_song(lyrics, meta)
+
+                        self.emit_line(
+                            await spotify.position()
+                        )
 
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
@@ -183,13 +248,21 @@ class SpotifyWorker(QObject):
 
         self.last_song = song
         self.last_index = None
+        self.song_label = f"{artist} — {title}"
+
+        # lyrics.py hands back plain lyrics with every line stamped 0,
+        # there is nothing to follow along with in that case
+        self.synced = any(
+            timestamp > 0
+            for timestamp in self.times
+        )
 
 
         if not self.current_lyrics:
 
             self.show_message(
                 "♪ No lyrics available",
-                context=f"{artist} — {title}"
+                context=self.song_label
             )
 
 
@@ -200,12 +273,42 @@ class SpotifyWorker(QObject):
             return
 
 
+        if not self.synced:
+
+            # unsynced: park on the opening lines instead of chasing
+            # a timestamp that never advances
+            if self.last_index == 0:
+                return
+
+            self.last_index = 0
+
+            self.lyrics_changed.emit(
+                self.song_label,
+                self.line_at(0),
+                self.line_at(1),
+            )
+
+            return
+
+
         index = bisect.bisect_right(self.times, position) - 1
 
         if index == self.last_index:
             return
 
         self.last_index = index
+
+
+        if index < 0:
+
+            # intro, nothing has been sung yet
+            self.lyrics_changed.emit(
+                self.song_label,
+                "",
+                self.line_at(0),
+            )
+
+            return
 
 
         self.lyrics_changed.emit(
@@ -245,63 +348,145 @@ class SpotifyWorker(QObject):
 
 
 
-AUTOSTART_FILE = (
-    Path(
+def config_home():
+
+    return Path(
         os.environ.get(
             "XDG_CONFIG_HOME",
             Path.home() / ".config"
         )
     )
-    / "autostart"
-    / "spotify-overlay.desktop"
-)
+
+
+def data_home():
+
+    return Path(
+        os.environ.get(
+            "XDG_DATA_HOME",
+            Path.home() / ".local" / "share"
+        )
+    )
+
+
+ENTRY_NAME = "spotify-overlay.desktop"
+
+ICON = HERE / "icon.png"
 
 
 DESKTOP_ENTRY = """[Desktop Entry]
 Type=Application
+Version=1.0
 Name=Spotify Lyrics Overlay
+GenericName=Lyrics Overlay
 Comment=Synced lyrics overlay for Spotify
 Exec={command}
-Icon=spotify
+Icon={icon}
 Terminal=false
-NoDisplay=true
+StartupNotify=false
+Categories=AudioVideo;Audio;Music;
+Keywords=spotify;lyrics;overlay;music;
+"""
+
+
+# shown in the applications grid, with a right-click action
+APPLICATION_EXTRA = """Actions=Locked;
+
+[Desktop Action Locked]
+Name=Start locked (ignores the mouse)
+Exec={command} --click-through
+"""
+
+
+# runs on login, hidden from the grid, late enough for Spotify to be up
+AUTOSTART_EXTRA = """NoDisplay=true
 X-GNOME-Autostart-enabled=true
 X-GNOME-Autostart-Delay=15
 """
 
 
-def install_autostart():
+def entry_paths():
+
+    return {
+        "app": data_home() / "applications" / ENTRY_NAME,
+        "autostart": config_home() / "autostart" / ENTRY_NAME,
+    }
+
+
+def write_entry(path, extra):
 
     command = "{python} {script}".format(
         python=shlex.quote(sys.executable),
-        script=shlex.quote(str(Path(__file__).resolve())),
+        script=shlex.quote(str(HERE / "app.py")),
     )
 
-    AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    AUTOSTART_FILE.write_text(
-        DESKTOP_ENTRY.format(command=command)
+    path.write_text(
+        DESKTOP_ENTRY.format(command=command, icon=ICON)
+        + extra.format(command=command)
     )
 
-    AUTOSTART_FILE.chmod(0o644)
-
-    print("Autostart installed:", AUTOSTART_FILE)
-    print("Starts on login, 15s late so Spotify comes up first.")
+    path.chmod(0o644)
 
 
+def install(target):
 
-def uninstall_autostart():
+    paths = entry_paths()
 
-    if not AUTOSTART_FILE.exists():
+    if target in ("all", "app"):
 
-        print("Autostart was not installed.")
+        write_entry(paths["app"], APPLICATION_EXTRA)
 
+        print("Registered as an application:", paths["app"])
+
+        refresh_menus()
+
+
+    if target in ("all", "autostart"):
+
+        write_entry(paths["autostart"], AUTOSTART_EXTRA)
+
+        print("Starts on login:", paths["autostart"])
+        print("  (15s late, so Spotify claims its D-Bus name first)")
+
+
+
+def uninstall(target):
+
+    paths = entry_paths()
+
+    for name, path in paths.items():
+
+        if target not in ("all", name):
+            continue
+
+        if path.exists():
+
+            path.unlink()
+
+            print("Removed:", path)
+
+        else:
+
+            print("Was not installed:", path)
+
+
+    refresh_menus()
+
+
+
+def refresh_menus():
+
+    directory = data_home() / "applications"
+
+    if not shutil.which("update-desktop-database"):
         return
 
-
-    AUTOSTART_FILE.unlink()
-
-    print("Autostart removed:", AUTOSTART_FILE)
+    subprocess.run(
+        ["update-desktop-database", str(directory)],
+        check=False,
+        capture_output=True,
+    )
 
 
 
@@ -312,26 +497,36 @@ def main():
     )
 
     parser.add_argument(
-        "--install-autostart",
-        action="store_true",
-        help="run the overlay automatically on login",
+        "--install",
+        nargs="?",
+        const="all",
+        choices=["all", "app", "autostart"],
+        help="register in the applications grid and run on login",
     )
 
     parser.add_argument(
-        "--uninstall-autostart",
+        "--uninstall",
+        nargs="?",
+        const="all",
+        choices=["all", "app", "autostart"],
+        help="undo --install",
+    )
+
+    parser.add_argument(
+        "--click-through",
         action="store_true",
-        help="remove the autostart entry",
+        help="ignore the mouse entirely (no dragging or resizing)",
     )
 
     args = parser.parse_args()
 
 
-    if args.install_autostart:
-        install_autostart()
+    if args.install:
+        install(args.install)
         return
 
-    if args.uninstall_autostart:
-        uninstall_autostart()
+    if args.uninstall:
+        uninstall(args.uninstall)
         return
 
 
@@ -345,7 +540,7 @@ def main():
     ticker.timeout.connect(lambda: None)
 
 
-    overlay = Overlay()
+    overlay = Overlay(click_through=args.click_through)
 
     overlay.show()
 
