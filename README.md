@@ -173,6 +173,8 @@ Issues and pull requests are welcome. Useful things to know:
 
 ## License
 
-Not yet chosen — add a `LICENSE` file before publishing, or the default "all rights
-reserved" applies and nobody can legally reuse it. MIT is the usual pick for something
-like this.
+[MIT](LICENSE) — do what you like with it, just keep the copyright notice.
+
+The `.so` files under `vendor/` are unmodified Debian builds of libxcb, libxkbcommon and
+friends, redistributed under their own (MIT-style) licenses; their copyright files ship
+alongside them in `vendor/usr/share/doc/`.
