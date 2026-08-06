@@ -1,67 +1,31 @@
-from dbus_next.aio import MessageBus
-from dbus_next import Variant
+"""Picks the now-playing backend that matches the OS.
+
+Both backends answer the same four coroutines — connect, metadata, status
+and position — and both report status in MPRIS's "Playing"/"Paused"/
+"Stopped" vocabulary, so nothing downstream knows which one it got.
+"""
+
 import asyncio
 
+import platform_support
 
-class Spotify:
 
-    BUS = "org.mpris.MediaPlayer2.spotify"
-    PATH = "/org/mpris/MediaPlayer2"
+if platform_support.WINDOWS:
+    from spotify_winrt import Spotify, BACKEND
 
-    async def connect(self):
-        self.bus = await MessageBus().connect()
+elif platform_support.LINUX:
+    from spotify_mpris import Spotify, BACKEND
 
-        introspection = await self.bus.introspect(
-            self.BUS,
-            self.PATH
-        )
+else:
+    raise ImportError(platform_support.unsupported_message())
 
-        obj = self.bus.get_proxy_object(
-            self.BUS,
-            self.PATH,
-            introspection
-        )
 
-        self.props = obj.get_interface(
-            "org.freedesktop.DBus.Properties"
-        )
-
-    async def metadata(self):
-
-        data = await self.props.call_get(
-            "org.mpris.MediaPlayer2.Player",
-            "Metadata"
-        )
-
-        md = data.value
-
-        return {
-            "title": md.get("xesam:title", Variant("s", "")).value,
-            "artist": md.get("xesam:artist", Variant("as", [""])).value[0],
-            "album": md.get("xesam:album", Variant("s", "")).value,
-        }
-
-    async def status(self):
-
-        state = await self.props.call_get(
-            "org.mpris.MediaPlayer2.Player",
-            "PlaybackStatus"
-        )
-
-        return state.value
-
-    async def position(self):
-
-        pos = await self.props.call_get(
-            "org.mpris.MediaPlayer2.Player",
-            "Position"
-        )
-
-        return pos.value / 1000000
-
+__all__ = ["Spotify", "BACKEND"]
 
 
 async def test():
+
+    print("Backend:", BACKEND, "on", platform_support.name())
 
     spotify = Spotify()
 
@@ -70,7 +34,7 @@ async def test():
     while True:
 
         print(await spotify.metadata())
-        print(await spotify.status())
+        print(await spotify.status(), await spotify.position())
 
         print("-" * 40)
 

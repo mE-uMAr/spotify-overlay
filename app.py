@@ -11,8 +11,23 @@ import threading
 
 from pathlib import Path
 
+import platform_support
+
+
+if not platform_support.SUPPORTED:
+    # said plainly here rather than as an ImportError traceback out of
+    # spotify.py, which is where it would otherwise surface
+    sys.exit(platform_support.unsupported_message())
+
 
 HERE = Path(__file__).resolve().parent
+
+# A PyInstaller build unpacks itself into a temp directory and runs from
+# there, so HERE finds the bundled icon but is gone by the next login:
+# anything written into a launcher has to point at the binary instead.
+FROZEN = getattr(sys, "frozen", False)
+
+INSTALL_DIR = Path(sys.executable).resolve().parent if FROZEN else HERE
 
 # libxcb-cursor0 and friends unpacked here without root, see the README
 VENDOR_LIB = HERE / "vendor" / "usr" / "lib" / "x86_64-linux-gnu"
@@ -26,7 +41,13 @@ def prefer_x11():
     this means going through XWayland, which is what QT_QPA_PLATFORM=xcb
     selects. LD_LIBRARY_PATH has to be set before the process starts, so
     the only way to apply it is to exec ourselves again.
+
+    Linux only — Windows has no X server to prefer and no Wayland to
+    escape, and the DWM is always already there.
     """
+
+    if not platform_support.LINUX:
+        return
 
     if os.environ.get("SPOTIFY_OVERLAY_RELAUNCHED"):
         return
@@ -61,10 +82,22 @@ prefer_x11()
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from overlay import Overlay
-from spotify import Spotify
 from lyrics import Lyrics
+
+try:
+    # the backend for this OS, and the one dependency that is not shared
+    from spotify import Spotify, BACKEND
+
+except ImportError as error:
+
+    sys.exit(
+        "{error}\n"
+        "(or install everything at once: "
+        "pip install -r requirements.txt)".format(error=error)
+    )
 
 
 POLL_INTERVAL = 0.2
@@ -151,7 +184,7 @@ class SpotifyWorker(QObject):
                         # nothing on screen yet to freeze
                         meta = await spotify.metadata()
 
-                        self.load_song(lyrics, meta)
+                        await self.load_song(lyrics, meta)
 
                         self.emit_line(
                             await spotify.position()
@@ -176,7 +209,7 @@ class SpotifyWorker(QObject):
 
                     meta = await spotify.metadata()
 
-                    self.load_song(lyrics, meta)
+                    await self.load_song(lyrics, meta)
 
 
                 tick += 1
@@ -222,7 +255,7 @@ class SpotifyWorker(QObject):
 
 
 
-    def load_song(self, lyrics, meta):
+    async def load_song(self, lyrics, meta):
 
         title = meta["title"]
         artist = meta["artist"]
@@ -236,26 +269,23 @@ class SpotifyWorker(QObject):
 
         print("Loading lyrics:", song)
 
-        self.current_lyrics = lyrics.get(
+        self.last_song = song
+        self.last_index = None
+        self.song_label = f"{artist} — {title}"
+
+        # the lookup walks several providers and can take seconds, which
+        # would otherwise stall the position polling and the pause check
+        self.current_lyrics, self.synced = await asyncio.to_thread(
+            lyrics.get,
             artist,
-            title
+            title,
+            meta.get("length"),
         )
 
         self.times = [
             timestamp
             for timestamp, _ in self.current_lyrics
         ]
-
-        self.last_song = song
-        self.last_index = None
-        self.song_label = f"{artist} — {title}"
-
-        # lyrics.py hands back plain lyrics with every line stamped 0,
-        # there is nothing to follow along with in that case
-        self.synced = any(
-            timestamp > 0
-            for timestamp in self.times
-        )
 
 
         if not self.current_lyrics:
@@ -264,6 +294,13 @@ class SpotifyWorker(QObject):
                 "♪ No lyrics available",
                 context=self.song_label
             )
+
+            return
+
+
+        if not self.synced:
+
+            print("  (no timings found, showing the words only)")
 
 
 
@@ -348,24 +385,9 @@ class SpotifyWorker(QObject):
 
 
 
-def config_home():
+config_home = platform_support.config_home
 
-    return Path(
-        os.environ.get(
-            "XDG_CONFIG_HOME",
-            Path.home() / ".config"
-        )
-    )
-
-
-def data_home():
-
-    return Path(
-        os.environ.get(
-            "XDG_DATA_HOME",
-            Path.home() / ".local" / "share"
-        )
-    )
+data_home = platform_support.data_home
 
 
 ENTRY_NAME = "spotify-overlay.desktop"
@@ -405,6 +427,23 @@ X-GNOME-Autostart-Delay=15
 
 
 def entry_paths():
+    """Where the launchers go, named the same on either platform.
+
+    "app" is the entry you find by searching the applications menu or the
+    Start menu, "autostart" is the one that runs it on login.
+    """
+
+    if platform_support.WINDOWS:
+
+        programs = (
+            config_home()
+            / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+        )
+
+        return {
+            "app": programs / SHORTCUT_NAME,
+            "autostart": programs / "Startup" / SHORTCUT_NAME,
+        }
 
     return {
         "app": data_home() / "applications" / ENTRY_NAME,
@@ -414,10 +453,10 @@ def entry_paths():
 
 def write_entry(path, extra):
 
-    command = "{python} {script}".format(
-        python=shlex.quote(sys.executable),
-        script=shlex.quote(str(HERE / "app.py")),
-    )
+    command = shlex.quote(str(launcher()))
+
+    if not FROZEN:
+        command += " " + shlex.quote(str(HERE / "app.py"))
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -429,13 +468,27 @@ def write_entry(path, extra):
     path.chmod(0o644)
 
 
+def write_launcher(path, autostart):
+
+    if platform_support.WINDOWS:
+
+        write_shortcut(path)
+
+        return
+
+    write_entry(
+        path,
+        AUTOSTART_EXTRA if autostart else APPLICATION_EXTRA,
+    )
+
+
 def install(target):
 
     paths = entry_paths()
 
     if target in ("all", "app"):
 
-        write_entry(paths["app"], APPLICATION_EXTRA)
+        write_launcher(paths["app"], autostart=False)
 
         print("Registered as an application:", paths["app"])
 
@@ -444,10 +497,18 @@ def install(target):
 
     if target in ("all", "autostart"):
 
-        write_entry(paths["autostart"], AUTOSTART_EXTRA)
+        write_launcher(paths["autostart"], autostart=True)
 
         print("Starts on login:", paths["autostart"])
-        print("  (15s late, so Spotify claims its D-Bus name first)")
+
+        if platform_support.WINDOWS:
+            # a .lnk in the Startup folder cannot ask to be held back, but
+            # the worker shows "Waiting for Spotify..." and keeps retrying
+            # until the client is up, so racing it costs nothing
+            print("  (reconnects on its own if Spotify starts later)")
+
+        else:
+            print("  (15s late, so Spotify claims its D-Bus name first)")
 
 
 
@@ -476,6 +537,10 @@ def uninstall(target):
 
 
 def refresh_menus():
+    """Linux only — the Start menu picks up new .lnk files by itself."""
+
+    if platform_support.WINDOWS:
+        return
 
     directory = data_home() / "applications"
 
@@ -490,10 +555,195 @@ def refresh_menus():
 
 
 
+# --- Windows shortcuts ---------------------------------------------------
+#
+# A .lnk is a binary format with no writer in the standard library, and
+# the usual answer, pywin32, would be a dependency carried for these few
+# lines alone. PowerShell ships with Windows and speaks the same COM
+# interface Explorer itself uses, so it does the writing.
+
+SHORTCUT_NAME = platform_support.APP_NAME + ".lnk"
+
+
+SHORTCUT_SCRIPT = (
+    "$shell = New-Object -ComObject WScript.Shell; "
+    "$link = $shell.CreateShortcut({path}); "
+    "$link.TargetPath = {target}; "
+    "$link.Arguments = {arguments}; "
+    "$link.WorkingDirectory = {directory}; "
+    "$link.Description = {description}; "
+    "{icon}"
+    "$link.Save()"
+)
+
+
+def powershell_quote(value):
+    """Into a PowerShell single-quoted string, where '' is a literal '."""
+
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def launcher():
+    """pythonw.exe when it is next to python.exe.
+
+    The overlay has no console to show, and a launcher pointing at
+    python.exe leaves a black window sitting behind it for as long as it
+    runs. A frozen build is its own launcher and needs neither.
+    """
+
+    executable = Path(sys.executable)
+
+    if FROZEN:
+        return executable
+
+    windowless = executable.with_name("pythonw.exe")
+
+    if windowless.exists():
+        return windowless
+
+    return executable
+
+
+def shortcut_icon():
+    """A .lnk wants an .ico, and the repo ships a .png.
+
+    Qt can write the one from the other, so the conversion happens once at
+    install time rather than asking for a second icon in the tree.
+    """
+
+    # written next to the binary, not into the temp directory a frozen
+    # build unpacks itself into, which is gone before the shortcut is
+    # ever clicked
+    icon = INSTALL_DIR / "icon.ico"
+
+    if icon.exists():
+        return icon
+
+    if not ICON.exists():
+        return None
+
+    try:
+
+        from PySide6.QtGui import QImage
+
+        image = QImage(str(ICON))
+
+        if not image.isNull() and image.save(str(icon), "ICO"):
+            return icon
+
+    except Exception as error:
+
+        print("Could not convert the icon, using the default:", error)
+
+    return None
+
+
+def write_shortcut(path):
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    icon = shortcut_icon()
+
+    script = SHORTCUT_SCRIPT.format(
+        path=powershell_quote(path),
+        target=powershell_quote(launcher()),
+        # quoted again inside the argument string, for the spaces a path
+        # like C:\Users\Me\My Projects\app.py carries
+        arguments=powershell_quote(
+            "" if FROZEN else '"{}"'.format(HERE / "app.py")
+        ),
+        directory=powershell_quote(INSTALL_DIR),
+        description=powershell_quote(
+            "Synced lyrics overlay for Spotify"
+        ),
+        icon=(
+            "$link.IconLocation = {}; ".format(powershell_quote(icon))
+            if icon is not None
+            else ""
+        ),
+    )
+
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+
+        raise RuntimeError(
+            "could not write {path}: {error}".format(
+                path=path,
+                error=result.stderr.strip() or result.returncode,
+            )
+        )
+
+
+
+SOCKET_NAME = "spotify-overlay-single-instance"
+
+
+def talk_to_running_instance(message=b""):
+    """Return True when an overlay is already up, optionally telling it something."""
+
+    socket = QLocalSocket()
+    socket.connectToServer(SOCKET_NAME)
+
+    if not socket.waitForConnected(400):
+        return False
+
+    if message:
+        socket.write(message)
+        socket.waitForBytesWritten(400)
+
+    socket.disconnectFromServer()
+
+    return True
+
+
+def claim_single_instance(application):
+    """Listen for later launches so a second copy cannot stack on the first."""
+
+    server = QLocalServer(application)
+
+    # a copy killed with SIGKILL leaves its socket behind
+    QLocalServer.removeServer(SOCKET_NAME)
+
+    server.listen(SOCKET_NAME)
+
+    def on_connection():
+
+        connection = server.nextPendingConnection()
+
+        if connection is None:
+            return
+
+        connection.waitForReadyRead(400)
+
+        if bytes(connection.readAll()).strip() == b"quit":
+
+            print("Asked to quit by another launch.")
+
+            application.quit()
+
+    server.newConnection.connect(on_connection)
+
+    return server
+
+
 def main():
 
     parser = argparse.ArgumentParser(
-        description="Synced lyrics overlay for Spotify on Linux."
+        description=(
+            "Synced lyrics overlay for Spotify, on Linux and Windows."
+        )
     )
 
     parser.add_argument(
@@ -501,7 +751,7 @@ def main():
         nargs="?",
         const="all",
         choices=["all", "app", "autostart"],
-        help="register in the applications grid and run on login",
+        help="register in the applications menu and run on login",
     )
 
     parser.add_argument(
@@ -518,7 +768,22 @@ def main():
         help="ignore the mouse entirely (no dragging or resizing)",
     )
 
+    parser.add_argument(
+        "--quit",
+        action="store_true",
+        help="close the running overlay",
+    )
+
     args = parser.parse_args()
+
+
+    print(
+        "{platform} detected, reading the current track from {backend}."
+        .format(
+            platform=platform_support.name(),
+            backend=BACKEND,
+        )
+    )
 
 
     if args.install:
@@ -531,6 +796,29 @@ def main():
 
 
     app = QApplication(sys.argv)
+
+
+    if args.quit:
+
+        if talk_to_running_instance(b"quit"):
+            print("Closed the running overlay.")
+
+        else:
+            print("No overlay was running.")
+
+        return
+
+
+    if talk_to_running_instance():
+
+        # relaunching from the applications grid used to stack a second
+        # copy on top of the first, both drawing the same lyrics
+        print("An overlay is already running, leaving it alone.")
+
+        return
+
+
+    server = claim_single_instance(app)
 
     # let Ctrl+C through the Qt event loop
     signal.signal(signal.SIGINT, signal.SIG_DFL)

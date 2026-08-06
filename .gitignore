@@ -1,0 +1,42 @@
+# ── Python ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# ── virtualenvs ──────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── PyInstaller (the Windows build) ──────────────────────────────
+build/
+dist/
+*.spec.bak
+
+# generated from icon.png at install time on Windows
+icon.ico
+
+# ── the overlay's own state ──────────────────────────────────────
+# geometry normally lives under the user's config dir, but a stray copy
+# next to the source is easy to make while testing
+state.json
+
+# ── editors and OS clutter ───────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── local tooling ────────────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/

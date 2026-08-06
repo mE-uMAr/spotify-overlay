@@ -3,6 +3,7 @@ from PySide6.QtCore import (
     QRectF,
     QPoint,
     QPointF,
+    QRect,
     QTimer,
     QPropertyAnimation,
     QEasingCurve,
@@ -23,7 +24,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QWidget,
     QVBoxLayout,
-    QSizeGrip,
     QGraphicsDropShadowEffect,
 )
 
@@ -33,29 +33,23 @@ import shutil
 import subprocess
 import sys
 
-from pathlib import Path
+import platform_support
 
 
-STATE_FILE = (
-    Path(
-        os.environ.get(
-            "XDG_CONFIG_HOME",
-            Path.home() / ".config"
-        )
+STATE_FILE = platform_support.state_file()
+
+
+# the Devanagari face in each list is what stops Hindi/Urdu lyrics from
+# shaping wrongly, and it is a different one on either platform
+FONT_STACK = (
+    ["Inter"]
+    + (
+        ["Segoe UI", "Nirmala UI"]
+        if platform_support.WINDOWS
+        else ["Ubuntu", "Noto Sans", "Noto Sans Devanagari"]
     )
-    / "spotify-overlay"
-    / "state.json"
+    + ["DejaVu Sans", "Sans Serif"]
 )
-
-
-FONT_STACK = [
-    "Inter",
-    "Ubuntu",
-    "Noto Sans",
-    "Noto Sans Devanagari",   # Hindi/Urdu lyrics shape wrongly without it
-    "DejaVu Sans",
-    "Sans Serif",
-]
 
 
 class FadeLabel(QLabel):
@@ -157,6 +151,7 @@ class GlassPanel(QWidget):
         self.dim = 1.0
 
         self.show_grip = True
+        self.show_close = True
 
     def set_paused(self, paused):
 
@@ -211,6 +206,28 @@ class GlassPanel(QWidget):
         if self.show_grip:
             self.paint_grip(painter, rect)
 
+        if self.show_close:
+            self.paint_close(painter, rect)
+
+    def paint_close(self, painter, rect):
+        """The only way out: the window has no frame and no taskbar entry."""
+
+        painter.setPen(QPen(self.faded(255, 255, 255, 150), 1.6))
+
+        centre_x = rect.right() - 18
+        centre_y = rect.top() + 18
+
+        arm = 5
+
+        painter.drawLine(
+            QPointF(centre_x - arm, centre_y - arm),
+            QPointF(centre_x + arm, centre_y + arm),
+        )
+        painter.drawLine(
+            QPointF(centre_x + arm, centre_y - arm),
+            QPointF(centre_x - arm, centre_y + arm),
+        )
+
     def paint_grip(self, painter, rect):
         """QSizeGrip draws nothing readable on glass, so mark the corner."""
 
@@ -231,8 +248,9 @@ class GlassPanel(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(255, 255, 255, 150))
 
-        x = rect.right() - 30
-        y = rect.top() + 18
+        # left corner, the right one belongs to the close button
+        x = rect.left() + 18
+        y = rect.top() + 11
 
         painter.drawRoundedRect(QRectF(x, y, 4, 14), 2, 2)
         painter.drawRoundedRect(QRectF(x + 8, y, 4, 14), 2, 2)
@@ -257,6 +275,7 @@ class Overlay(QWidget):
         self._dim = self.PLAYING_DIM
         self.labels = []
         self.drag_origin = None
+        self.resize_origin = None
 
         self.setWindowTitle("Spotify Overlay")
 
@@ -272,13 +291,14 @@ class Overlay(QWidget):
         # whenever the application is deactivated, which is exactly what
         # happens when you click on anything else.
 
-        self.unmanaged = not on_wayland()
+        # X11 only: an unmanaged window is not stacked, not owned and not
+        # put on a workspace by any window manager, so it floats above
+        # every app and follows you between workspaces. Windows has no
+        # equivalent — there the shell always owns the window, and
+        # keep_above_everything re-asserts topmost instead.
+        self.unmanaged = platform_support.LINUX and not on_wayland()
 
         if self.unmanaged:
-
-            # unmanaged window: the window manager does not stack it, does
-            # not own it and does not put it on a workspace, so it floats
-            # above every app and follows you between workspaces
             flags |= Qt.WindowType.X11BypassWindowManagerHint
 
         if click_through:
@@ -329,11 +349,12 @@ class Overlay(QWidget):
 
         self.current_label.setText("♪ Waiting for Spotify...")
 
-        self.grip = QSizeGrip(self)
-        self.grip.setFixedSize(18, 18)
-        self.grip.setVisible(not click_through)
+        # QSizeGrip resizes through the window manager, which an unmanaged
+        # window does not have, so the corner is handled by hand below
+        self.interactive = not click_through
 
-        self.panel.show_grip = not click_through
+        self.panel.show_grip = self.interactive
+        self.panel.show_close = self.interactive
 
         self.setMinimumSize(self.MIN_WIDTH, self.MIN_HEIGHT)
 
@@ -400,11 +421,6 @@ class Overlay(QWidget):
 
         super().resizeEvent(event)
 
-        self.grip.move(
-            self.width() - self.grip.width() - self.MARGIN + 2,
-            self.height() - self.grip.height() - self.MARGIN + 2,
-        )
-
         self.save_timer.start()
 
     def moveEvent(self, event):
@@ -413,17 +429,63 @@ class Overlay(QWidget):
 
         self.save_timer.start()
 
+    def close_button(self):
+        """Hit area of the ✕, in the overlay's own coordinates."""
+
+        return QRect(
+            self.width() - self.MARGIN - 30,
+            self.MARGIN + 4,
+            26,
+            26,
+        )
+
+    def grip_area(self):
+
+        return QRect(
+            self.width() - self.MARGIN - 26,
+            self.height() - self.MARGIN - 26,
+            26,
+            26,
+        )
+
     def mousePressEvent(self, event):
+
+        if not self.interactive:
+            return
 
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
-        handle = self.windowHandle()
+        where = event.position().toPoint()
 
-        # the compositor moves the window for us where it can, which is the
-        # only thing that works under Wayland
-        if handle is not None and handle.startSystemMove():
+        if self.close_button().contains(where):
+
+            self.save_state()
+
+            QApplication.quit()
+
             return
+
+
+        if self.grip_area().contains(where):
+
+            self.resize_origin = (
+                event.globalPosition().toPoint(),
+                self.size(),
+            )
+
+            return
+
+
+        # startSystemMove asks the window manager to take over, and an
+        # unmanaged window has none — it reports success and nothing moves
+        if not self.unmanaged:
+
+            handle = self.windowHandle()
+
+            if handle is not None and handle.startSystemMove():
+                return
+
 
         self.drag_origin = (
             event.globalPosition().toPoint()
@@ -432,20 +494,35 @@ class Overlay(QWidget):
 
     def mouseMoveEvent(self, event):
 
-        if self.drag_origin is None:
-            return
-
         if not event.buttons() & Qt.MouseButton.LeftButton:
             return
 
-        self.move(
-            event.globalPosition().toPoint()
-            - self.drag_origin
-        )
+
+        if self.resize_origin is not None:
+
+            start, size = self.resize_origin
+
+            shift = event.globalPosition().toPoint() - start
+
+            self.resize(
+                max(size.width() + shift.x(), self.MIN_WIDTH),
+                max(size.height() + shift.y(), self.MIN_HEIGHT),
+            )
+
+            return
+
+
+        if self.drag_origin is not None:
+
+            self.move(
+                event.globalPosition().toPoint()
+                - self.drag_origin
+            )
 
     def mouseReleaseEvent(self, event):
 
         self.drag_origin = None
+        self.resize_origin = None
 
     # --- persistence -------------------------------------------------
 
@@ -568,6 +645,9 @@ def on_wayland():
     honest answer.
     """
 
+    if not platform_support.LINUX:
+        return False
+
     application = QApplication.instance()
 
     if application is not None:
@@ -579,12 +659,21 @@ def on_wayland():
 def stick_everywhere(widget):
     """Show the overlay on every workspace, above every other window.
 
-    Qt has no API for "sticky", so this goes straight at the EWMH hints.
-    It needs an X11 session: under a native Wayland session the compositor
-    owns window placement and stacking outright, and GNOME exposes no
-    protocol for either — run under XWayland (QT_QPA_PLATFORM=xcb) for this
-    to bite.
+    Qt has no API for "sticky", so on Linux this goes straight at the EWMH
+    hints. It needs an X11 session: under a native Wayland session the
+    compositor owns window placement and stacking outright, and GNOME
+    exposes no protocol for either — run under XWayland
+    (QT_QPA_PLATFORM=xcb) for this to bite.
+
+    Windows takes the user32 route in win32.py, which gets the "above
+    every window" half but not the "every workspace" half.
     """
+
+    if platform_support.WINDOWS:
+
+        import win32
+
+        return win32.keep_above_everything(int(widget.winId()))
 
     if on_wayland():
         return False
@@ -646,8 +735,17 @@ def enable_backdrop_blur(widget):
 
     KWin (and picom with the KDE rule) honour _KDE_NET_WM_BLUR_BEHIND_REGION.
     GNOME / Mutter exposes no such hint, so this is a no-op there and the
-    painted glass gradient carries the look on its own.
+    painted glass gradient carries the look on its own. On Windows the DWM
+    is asked the same favour through win32.py.
     """
+
+    if platform_support.WINDOWS:
+
+        import win32
+
+        win32.enable_blur_behind(int(widget.winId()))
+
+        return
 
     if on_wayland():
         return

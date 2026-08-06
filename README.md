@@ -20,9 +20,17 @@ Track info comes from MPRIS over D-Bus, synced lyrics come from [LRCLIB](https:/
 .venv/bin/python app.py --click-through   # ignore the mouse once it is where you want it
 ```
 
-Drag the panel to move it, drag the marked bottom-right corner to resize it. It never
-takes keyboard focus, so typing in the window underneath is not interrupted. Ctrl+C in
-the terminal quits it.
+Drag the panel to move it, drag the marked bottom-right corner to resize it, click the ✕
+in the top-right to close it. It never takes keyboard focus, so typing in the window
+underneath is not interrupted. Ctrl+C in the terminal works too, and `--quit` closes an
+overlay started from the applications grid:
+
+```bash
+.venv/bin/python app.py --quit
+```
+
+Only one overlay runs at a time: launching a second one hands off to the first and exits,
+rather than stacking a duplicate on top of it.
 
 ## Autostart on Ubuntu
 
@@ -62,6 +70,14 @@ that it is drawn on several at once.
 - Real backdrop blur is asked for via `_KDE_NET_WM_BLUR_BEHIND_REGION`, which KWin honours.
   GNOME/Mutter — Ubuntu's default — exposes no blur API to applications, so there the
   frosted look comes entirely from the painted gradient.
-- Songs without synced lyrics on LRCLIB show the track name instead.
+- Lyrics are looked up in this order: LRCLIB exact match, LRCLIB search (retried with the
+  title stripped of `(From "…")`-style decoration, then with only the first credited
+  artist, then title-only), NetEase, and finally the wordless providers, Genius and
+  lyrics.ovh. **Real synced lyrics from any provider beat plain lyrics from every
+  provider** — plain lyrics have no timestamps, so anything built from them drifts against
+  the song. When only those are found the overlay says so and parks on the opening lines
+  instead of pretending to follow along.
+- Providers list several versions of the same song. The one whose length is closest to the
+  track actually playing wins, which is what keeps the lines from running early or late.
 - The 16px transparent margin around the panel (it carries the drop shadow) is part of the
   window, so it catches clicks too unless `--click-through` is on.

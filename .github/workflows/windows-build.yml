@@ -1,0 +1,80 @@
+name: Windows build
+
+# Builds the standalone .exe. Runs on every push and pull request so a
+# broken Windows build is caught by the commit that caused it, and
+# attaches the binary to the release when a tag is pushed.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Check the Windows backend imports
+        # catches a missing dependency or a typo in the WinRT paths here,
+        # where the error is readable, instead of inside a frozen .exe
+        run: |
+          python -c "import platform_support; assert platform_support.WINDOWS"
+          python -c "import spotify; print('backend:', spotify.BACKEND)"
+          python -c "import win32, overlay, transliterate"
+
+      - name: Romanization sanity check
+        run: |
+          python -c "from transliterate import romanize; assert romanize('दिल') == 'dil', romanize('दिल'); assert romanize('ਰੰਗ') == 'rang', romanize('ਰੰਗ'); print('romanization ok')"
+
+      - name: Make the icon
+        # a .lnk and an .exe both want .ico, and the repo ships .png
+        run: |
+          python -c "from PySide6.QtGui import QImage; QImage('icon.png').save('icon.ico', 'ICO')"
+
+      - name: Build
+        run: pyinstaller --noconfirm spotify-overlay.spec
+
+      - name: Smoke-test the executable
+        # no Spotify and no desktop session on the runner, so it cannot
+        # play anything — this only proves the binary starts, finds its
+        # Qt plugins and does not crash on import
+        run: |
+          $process = Start-Process -FilePath dist\SpotifyLyricsOverlay.exe -PassThru
+          Start-Sleep -Seconds 20
+          if ($process.HasExited) {
+            Write-Error "the overlay exited on its own with code $($process.ExitCode)"
+            exit 1
+          }
+          Stop-Process -Id $process.Id -Force
+          Write-Host "started and stayed up"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SpotifyLyricsOverlay-windows
+          path: dist/SpotifyLyricsOverlay.exe
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SpotifyLyricsOverlay.exe
+          generate_release_notes: true
