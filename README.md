@@ -26,7 +26,18 @@ or not you read the script.
 ## Install
 
 Grab a prebuilt binary from the [releases page](../../releases) — `SpotifyLyricsOverlay.exe`
-for Windows, `spotify-overlay` for Linux — or run from source:
+for Windows, `spotify-overlay` for Linux. No account needed. Every push to `main` also
+publishes a [rolling build](../../releases/tag/latest) if you want the newest changes
+before they are tagged.
+
+On Linux, mark it executable first:
+
+```bash
+chmod +x spotify-overlay
+./spotify-overlay
+```
+
+Or run from source:
 
 ```bash
 git clone https://github.com/me-umar/spotify-overlay
@@ -136,8 +147,11 @@ pyinstaller spotify-overlay.spec
 
 One spec covers both platforms — it excludes the other OS's backend and picks the right
 name, icon and console setting. The GitHub Actions workflows in `.github/workflows/` run
-exactly that on `windows-latest` and `ubuntu-22.04` for every push and pull request, and
-attach the binaries to the release when a `v*` tag is pushed.
+exactly that on `windows-latest` and `ubuntu-22.04` for every push and pull request. Pushing
+a `v*` tag attaches the binaries to that release; a push to `main` refreshes the rolling
+`latest` prerelease instead. Pull request builds stay as run artifacts, which are only
+reachable by signed-in users with read access and expire after 90 days — that is a GitHub
+limitation, so anything meant for users goes to a release.
 
 ## Notes
 

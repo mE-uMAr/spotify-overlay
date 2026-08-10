@@ -67,6 +67,10 @@ jobs:
           Write-Host "started and stayed up"
 
       - uses: actions/upload-artifact@v4
+        # for pull requests, where there is no release to publish to. run
+        # artifacts are not public — they need a signed-in account with read
+        # access and expire after 90 days — so the publish job below is what
+        # actually gets a binary to users
         with:
           name: SpotifyLyricsOverlay-windows
           path: dist/SpotifyLyricsOverlay.exe
@@ -78,3 +82,48 @@ jobs:
         with:
           files: dist/SpotifyLyricsOverlay.exe
           generate_release_notes: true
+
+  publish-latest:
+    # a rolling prerelease so the newest main build is downloadable by
+    # anyone without a GitHub account. tagged v* builds go to their own
+    # release from the build job above and are untouched by this.
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # the release only needs the built .exe, so this does not need a
+    # Windows runner
+    runs-on: ubuntu-22.04
+    # the Linux and Windows workflows publish to the same release, so let
+    # only one of them write to it at a time
+    concurrency:
+      group: publish-latest
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: SpotifyLyricsOverlay-windows
+          path: dist
+
+      - name: Move the latest tag to this commit
+        # the Linux workflow does this too — both point the tag at the same
+        # commit, so whichever runs first wins and the other is a no-op.
+        # "latest" does not match the v* trigger, so this does not loop.
+        run: |
+          git tag -f latest
+          git push -f origin latest
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest main build
+          body: >
+            Automatically rebuilt from the tip of `main`
+            (${{ github.sha }}). For a stable version, use the newest `v*`
+            release instead.
+          prerelease: true
+          # do not let a rolling build displace the newest tagged release
+          # as the one the repo page points at
+          make_latest: false
+          files: dist/SpotifyLyricsOverlay.exe
