@@ -1,5 +1,4 @@
 """The Windows half of the overlay's window tricks.
-
 Linux gets its always-on-top and its blur by shelling out to xprop and
 wmctrl; neither exists here, so the same two jobs go straight at user32
 through ctypes. Everything is best effort — the painted glass panel in
