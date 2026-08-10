@@ -8,7 +8,8 @@ Hindi, Punjabi and Urdu lyrics are romanized on the way in, so
 `ਚੁੱਪ ਕਰ ਲੰਘ ਜਾਵੇ` reaches the screen as `chupp kar langh jaave` — readable whether
 or not you read the script.
 
-<!-- a screenshot or short gif of the overlay over a desktop goes well here -->
+<img width="1880" height="957" alt="Screenshot From 2026-08-10 11-16-14" src="https://github.com/user-attachments/assets/edf5b7cd-d799-4c05-b5ed-de9edcb232ff" />
+
 
 ## Features
 
